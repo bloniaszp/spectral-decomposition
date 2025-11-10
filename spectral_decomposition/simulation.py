@@ -1,28 +1,9 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from numpy.fft import ifft, ifftshift
+from numpy.fft import ifft
 from math import ceil, log2
 
 def make_broadband_predictor(freqs, f_low, f_high, *, exponent=1.0, knee=0.0):
-    """
-    Shape function for the 1/f broadband term,   S_bb(f) ∝ 1 / (knee + |f|^exponent)
-
-    Parameters
-    ----------
-    freqs : 1-D array
-        Frequency axis (can be two-sided or one-sided, any length).
-    f_low, f_high : float
-        Lower / upper frequency bounds (Hz) that define the predictor mask.
-    exponent : float, optional
-        Aperiodic exponent  (default = 1.0).
-    knee : float, optional
-        Knee parameter k  (default = 0 → pure power-law).
-
-    Returns
-    -------
-    shape : np.ndarray  (same length as `freqs`)
-        Predictor column, zero outside [f_low, f_high].
-    """
     freqs = np.asarray(freqs)
     mask  = (freqs >= f_low) & (freqs <= f_high) & (freqs > 0)
     shape = np.zeros_like(freqs, dtype=float)
@@ -30,59 +11,103 @@ def make_broadband_predictor(freqs, f_low, f_high, *, exponent=1.0, knee=0.0):
     return shape
 
 def make_gaussian_bump_predictor(freqs, f_low, f_high, *, center, sigma):
-    """
-    Shape function for a rhythmic peak,
-        S_peak(f) ∝ exp(-(f - center)² / (2 σ²))
-
-    Parameters
-    ----------
-    freqs : 1-D array
-        Frequency axis (same length/order as the empirical PSD).
-    f_low, f_high : float
-        Lower / upper frequency bounds for the mask.
-    center : float
-        Peak centre frequency f₀ (Hz).
-    sigma : float
-        Std-dev (Hz) of the Gaussian bump.
-
-    Returns
-    -------
-    shape : np.ndarray  (same length as `freqs`)
-        Predictor column, zero outside [f_low, f_high].
-    """
     freqs = np.asarray(freqs)
     mask  = (freqs >= f_low) & (freqs <= f_high)
     shape = np.zeros_like(freqs, dtype=float)
     shape[mask] = np.exp(-((freqs[mask] - center)**2) / (2.0 * sigma**2))
     return shape
 
-
 def simulate_from_psd(PSD, fs, n_fft, n_time, random_seed=None, lambda_0=0.0):
+    import numpy as np
+    from numpy.fft import ifft
+
+    if random_seed is not None:
+        rng = np.random.RandomState(random_seed)
+    else:
+        rng = np.random
+
+    if len(PSD) != n_fft:
+        raise ValueError(f"PSD length ({len(PSD)}) must match n_fft={n_fft}.")
+
+    halfM = n_fft // 2
+    U = np.zeros(n_fft, dtype=np.complex128)
+
+    # DC
+    U[0] = np.sqrt(max(PSD[0], 0.0)) * rng.randn()
+
+    if n_fft % 2 == 0:
+        # EVEN n_fft: positives 1..halfM-1
+        pos_psd = PSD[1:halfM] / 2.0
+        amp = np.sqrt(np.maximum(pos_psd, 0.0))
+        U[1:halfM] = amp * (rng.randn(len(amp)) + 1j * rng.randn(len(amp)))
+        # Nyquist (pure real)
+        U[halfM] = np.sqrt(max(PSD[halfM], 0.0)) * rng.randn()
+        # negatives mirror of 1..halfM-1
+        U[halfM+1:] = np.conj(U[1:halfM][::-1])
+    else:
+        # ODD n_fft: positives 1..halfM
+        pos_psd = PSD[1:halfM+1] / 2.0
+        amp = np.sqrt(np.maximum(pos_psd, 0.0))
+        U[1:halfM+1] = amp * (rng.randn(len(amp)) + 1j * rng.randn(len(amp)))
+        # negatives mirror of 1..halfM
+        U[halfM+1:] = np.conj(U[1:halfM+1][::-1])
+
+    # IFFT (unshifted)
+    signal_freq_domain = np.sqrt(fs * n_fft) * ifft(U)
+    time_signal = np.real(signal_freq_domain[:n_time])
+    time_signal += lambda_0
+    return time_signal
+
+
+def simulate_from_psd_legacy(PSD, fs, n_fft, n_time, random_seed=None, lambda_0=0.0):
+    import numpy as np
+    from numpy.fft import ifft
+
+    if random_seed is not None:
+        rng = np.random.RandomState(random_seed)
+    else:
+        rng = np.random
+
+    if len(PSD) != n_fft:
+        raise ValueError(f"PSD length ({len(PSD)}) must match n_fft={n_fft}.")
+
+    halfM = n_fft // 2
+    U = np.zeros(n_fft, dtype=np.complex128)
+
+    # DC
+    U[0] = np.sqrt(max(PSD[0], 0.0)) * rng.randn()
+
+    if n_fft % 2 == 0:
+        # EVEN n_fft
+        # positives 1..halfM-1
+        pos_psd = PSD[1:halfM] / 2.0
+        amp = np.sqrt(np.maximum(pos_psd, 0.0))
+        U[1:halfM] = amp * (rng.randn(len(amp)) + 1j * rng.randn(len(amp)))
+        # Nyquist at halfM (pure real)
+        U[halfM] = np.sqrt(max(PSD[halfM], 0.0)) * rng.randn()
+        # negatives mirror of 1..halfM-1
+        U[halfM+1:] = np.conj(U[1:halfM][::-1])
+    else:
+        # ODD n_fft
+        # positives 1..halfM
+        pos_psd = PSD[1:halfM+1] / 2.0
+        amp = np.sqrt(np.maximum(pos_psd, 0.0))
+        U[1:halfM+1] = amp * (rng.randn(len(amp)) + 1j * rng.randn(len(amp)))
+        # no Nyquist bin
+        # negatives mirror of 1..halfM
+        U[halfM+1:] = np.conj(U[1:halfM+1][::-1])
+
+    # IFFT (unshifted)
+    signal_freq_domain = np.sqrt(fs * n_fft) * ifft(U)
+    time_signal = np.real(signal_freq_domain[:n_time])
+    time_signal += lambda_0
+    return time_signal
+
+
+def simulate_from_psd_legacy(PSD, fs, n_fft, n_time, random_seed=None, lambda_0=0.0):
     """
-    Draw a time-domain realization via random phases + iFFT from 'PSD'.
-
-    * PSD is length = n_fft (the large frequency grid).
-    * The final time signal is length = n_time (the actual desired #samples).
-
-    Parameters
-    ----------
-    PSD : np.ndarray, shape (n_fft,)
-        Two-sided PSD array (unshifted, DC at index=0, possibly Nyquist at n_fft//2).
-    fs : float
-        Sampling rate in Hz.
-    n_fft : int
-        Size of the FFT grid used to define PSD and do the iFFT (often >> n_time).
-    n_time : int
-        Number of samples to keep in the final time-domain output.
-    random_seed : int or None
-        For reproducible random phases.
-    lambda_0 : float
-        Constant offset added to the final time-domain signal.
-
-    Returns
-    -------
-    time_signal : np.ndarray, shape (n_time,)
-        Real-valued time-domain signal.
+    Draw a real time-domain signal whose (two-sided, unshifted) PSD is `PSD`.
+    `PSD` must be in *unshifted* FFT order (DC at 0, +freqs, then -freqs).
     """
     if random_seed is not None:
         rng = np.random.RandomState(random_seed)
@@ -93,31 +118,27 @@ def simulate_from_psd(PSD, fs, n_fft, n_time, random_seed=None, lambda_0=0.0):
         raise ValueError(f"PSD length ({len(PSD)}) must match n_fft={n_fft}.")
 
     halfM = n_fft // 2
-
-    # Build random complex amplitudes
     U = np.zeros(n_fft, dtype=np.complex128)
 
-    # DC bin
-    U[0] = np.sqrt(PSD[0]) * rng.randn()
+    # DC
+    U[0] = np.sqrt(max(PSD[0], 0.0)) * rng.randn()
 
-    # Positive freqs: 1..halfM
-    pos_psd = PSD[1 : halfM + 1] / 2.0
-    amp = np.sqrt(pos_psd)
-    U[1 : halfM + 1] = amp * rng.randn(len(amp)) + 1j * amp * rng.randn(len(amp))
+    # Positive frequencies (1..halfM-1 if even; 1..halfM if odd)
+    pos_stop = halfM if (n_fft % 2 == 0) else (halfM + 1)
+    pos_psd = PSD[1:pos_stop] / 2.0
+    amp = np.sqrt(np.maximum(pos_psd, 0.0))
+    U[1:pos_stop] = amp * (rng.randn(len(amp)) + 1j * rng.randn(len(amp)))
 
-    # Negative freqs (mirror for real-valued ifft)
-    U[halfM + 1 :] = np.flipud(np.conj(U[1 : n_fft - halfM]))
-
-    # Nyquist bin if even
+    # Nyquist (if even)
     if n_fft % 2 == 0:
-        U[halfM] = np.sqrt(PSD[halfM]) * rng.randn()
+        U[halfM] = np.sqrt(max(PSD[halfM], 0.0)) * rng.randn()
 
-    # iFFT
-    signal_freq_domain = np.sqrt(fs * n_fft) * ifft(ifftshift(U))
-    # Keep only the first n_time samples
-    time_signal = np.real_if_close(signal_freq_domain[:n_time])
+    # Negative freqs (Hermitian symmetry)
+    U[pos_stop:] = np.conj(U[1:pos_stop][::-1])
 
-    # Add offset
+    # IFFT in *unshifted* order — no extra shifts
+    signal_freq_domain = np.sqrt(fs * n_fft) * ifft(U)
+    time_signal = np.real(signal_freq_domain[:n_time])
     time_signal += lambda_0
     return time_signal
 
@@ -125,23 +146,19 @@ def _nextpow2(x):
     return 2**int(ceil(log2(x)))
 
 class BaseSimulator(ABC):
-    """Abstract base class for time series simulation."""
     @abstractmethod
     def simulate(self):
         raise NotImplementedError
 
 class CombinedSimulator(BaseSimulator):
     """
-    Generates a combined time series with broadband (aperiodic) and rhythmic (periodic) components,
-    using a large n_fft for high-resolution PSD, then slicing the first n_samples in time domain.
+    Simulate broadband + rhythmic with either additive *or* multiplicative
+    composition in *linear* PSD space.
 
-    Steps:
-      1) Define n_fft >> n_samples for the frequency grid (user can set or we pick automatically).
-      2) Build symmetrical freq axis [-fs/2..+fs/2) of length n_fft.
-      3) Construct broadband PSD = 10^(aperiodic_offset)/(knee^2 + |f|^exponent).
-      4) Construct rhythmic PSD via Gaussians at ±f0, sum => combined PSD.
-      5) iFFT => time signals of length n_fft
-      6) Add `average_firing_rate` in time domain (should be zero basically always this is just an offset).
+      additive:        P(f) = P_bb(f) + P_rh(f)
+      multiplicative:  P(f) = P_bb(f) * 10**G(f)     (G built from peaks in log10 units)
+
+    Peaks are modeled as Gaussians at ±f0 on the two-sided frequency axis.
     """
     def __init__(
         self,
@@ -155,36 +172,12 @@ class CombinedSimulator(BaseSimulator):
         average_firing_rate=0.0,
         n_fft=None,
         target_df=0.01,
-        random_state=None
+        random_state=None,
+        mode: str = "additive",  # <— now supported, propagated from API
     ):
-        """
-        Parameters
-        ----------
-        sampling_rate : float
-            Sampling rate (Hz).
-        n_samples : int
-            Number of time-domain samples to return.
-        duration : float
-            If n_samples not given, compute it via duration * sampling_rate.
-        aperiodic_exponent : float
-            1/f exponent.
-        aperiodic_offset : float
-            log10 offset for the aperiodic PSD.
-        knee : float or None
-            Knee parameter (k^2 in denominator).
-        peaks : list of dict
-            Each with {'freq':..., 'amplitude':..., 'sigma':...}.
-        average_firing_rate : float
-            DC offset added to the final combined time signal.
-        n_fft : int or None
-            FFT size for building PSD (often >> n_samples). If None, pick for the user (big enough to be extremely smooth)
-            above n_samples + some offset.
-        random_state : int or None
-            Seed for reproducible phases.
-        """
         self.sampling_rate = sampling_rate
 
-        # Determine final time-series length
+        # time length
         if n_samples is None:
             if duration is None:
                 raise ValueError("Must specify either n_samples or duration.")
@@ -198,6 +191,7 @@ class CombinedSimulator(BaseSimulator):
                 if expected_n != self.n_samples:
                     raise ValueError("n_samples and duration are inconsistent.")
 
+        # big FFT grid
         if n_fft is None:
             required = int(ceil(self.sampling_rate / target_df))
             required = max(required, self.n_samples)
@@ -205,70 +199,75 @@ class CombinedSimulator(BaseSimulator):
         else:
             self.n_fft = int(n_fft)
 
-        self.aperiodic_exponent = aperiodic_exponent
-        self.aperiodic_offset = aperiodic_offset
-        self.knee = knee if knee is not None else 0.0
-        self.peaks = peaks if peaks is not None else []
-        self.average_firing_rate = average_firing_rate
+        self.aperiodic_exponent = float(aperiodic_exponent)
+        self.aperiodic_offset = float(aperiodic_offset)
+        self.knee = 0.0 if knee is None else float(knee)
+        self.peaks = [] if peaks is None else list(peaks)
+        self.average_firing_rate = float(average_firing_rate)
         self.random_state = random_state
+        if mode not in ("additive", "multiplicative"):
+            raise ValueError(f"Unknown mode: {mode!r}")
+        self.mode = mode
+
+    def _build_two_sided_freqs(self):
+        # Unshifted FFT freq order: [0, +f, ..., Nyq, -f,...]
+        return np.fft.fftfreq(self.n_fft, d=1.0 / self.sampling_rate)
 
     def simulate(self):
-        """
-        Returns
-        -------
-        TimeDomainData
-            Contains time array and broadband_signal, rhythmic_signal, combined_signal.
-        """
         fs = self.sampling_rate
         n_time = self.n_samples
         n_fft = self.n_fft
-        rng_seed = self.random_state
+        freqs = np.fft.fftfreq(n_fft, d=1.0 / fs)
 
-        # Build symmetrical freq axis of length n_fft: [-fs/2 .. +fs/2)
-        freqs_shifted = np.fft.fftfreq(n_fft, d=1.0/fs) 
-        #freqs_shifted = np.fft.fftshift(freqs_shifted)
+        # Aperiodic baseline (linear power)
+        denom = (self.knee + np.abs(freqs) ** self.aperiodic_exponent)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            P_bb = (10.0 ** self.aperiodic_offset) / denom
+        P_bb[0] = 0.0
 
-        # Broadband PSD: 10^(offset) / (k + |f|^exponent)
-        denom = (self.knee + np.abs(freqs_shifted)**self.aperiodic_exponent)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            broadband_psd_shifted = (10.0**self.aperiodic_offset) / denom
-        zero_idx = np.argmin(np.abs(freqs_shifted))
-        broadband_psd_shifted[zero_idx] = 0.0
+        # Helper: distinct seeds (safe if None)
+        s0 = self.random_state
+        seed_bb = s0
+        seed_rh = None if s0 is None else s0 + 1
+        seed_comb = None if s0 is None else s0 + 2
 
-        # Rhythmic PSD: sum Gaussians around ±f0
-        rhythmic_psd_shifted = np.zeros_like(freqs_shifted)
-        for peak in self.peaks:
-            f0 = peak.get('freq')
-            amp = peak.get('amplitude')
-            sigma = peak.get('sigma', None)
-            if f0 is None or amp is None or sigma is None:
-                continue
-            rhythmic_psd_shifted += amp * np.exp(-((freqs_shifted - f0)**2)/(2*sigma**2))
-            rhythmic_psd_shifted += amp * np.exp(-((freqs_shifted + f0)**2)/(2*sigma**2))
-        rhythmic_psd_shifted[zero_idx] = 0.0
+        if self.mode == "additive":
+            # Rhythmic in *linear* power and two-sided (±f0)
+            P_rh = np.zeros_like(freqs)
+            for pk in self.peaks:
+                f0 = float(pk["freq"]); amp = float(pk["amplitude"]); sigma = float(pk["sigma"])
+                P_rh += amp * np.exp(-((freqs - f0) ** 2) / (2 * sigma ** 2))
+                P_rh += amp * np.exp(-((freqs + f0) ** 2) / (2 * sigma ** 2))
+            P_rh[0] = 0.0
+            P_comb = P_bb + P_rh
 
-        # Combined PSD (shifted)
-        combined_psd_shifted = broadband_psd_shifted + rhythmic_psd_shifted
+            # Independent phase draws for each partial
+            broadband_signal_big = simulate_from_psd(P_bb,   fs, n_fft, n_fft, random_seed=seed_bb, lambda_0=0.0)
+            rhythmic_signal_big  = simulate_from_psd(P_rh,   fs, n_fft, n_fft, random_seed=seed_rh, lambda_0=0.0)
+            combined_signal_big  = broadband_signal_big + rhythmic_signal_big
 
-        # For simulation, we need unshifted PSD
-        broadband_psd_unshifted = np.fft.ifftshift(broadband_psd_shifted)
-        rhythmic_psd_unshifted  = np.fft.ifftshift(rhythmic_psd_shifted)
-        combined_psd_unshifted  = np.fft.ifftshift(combined_psd_shifted)
+        else:  # multiplicative
+            # Peaks as log10-power bumps: P = P_bb * 10**G
+            G = np.zeros_like(freqs)
+            for pk in self.peaks:
+                f0 = float(pk["freq"]); a_log = float(pk["amplitude"]); sigma = float(pk["sigma"])
+                G += a_log * np.exp(-((freqs - f0) ** 2) / (2 * sigma ** 2))
+                G += a_log * np.exp(-((freqs + f0) ** 2) / (2 * sigma ** 2))
+            P_comb = P_bb * np.power(10.0, G)
+            P_comb[0] = 0.0
 
-        # Simulate each partial, slice out n_time
-        broadband_signal_big = simulate_from_psd(
-            broadband_psd_unshifted, fs, n_fft, n_fft,
-            random_seed=rng_seed, lambda_0=0.0
-        )
-        rhythmic_signal_big = simulate_from_psd(
-            rhythmic_psd_unshifted, fs, n_fft, n_fft,
-            random_seed=rng_seed + 1, lambda_0=0.0
-        )
-        combined_signal_big = broadband_signal_big + rhythmic_signal_big 
+            # Combined signal draw (this is the *true* multiplicative model)
+            combined_signal_big = simulate_from_psd(P_comb, fs, n_fft, n_fft, random_seed=seed_comb, lambda_0=0.0)
 
+            # Optional: independent illustrative parts (won't sum to combined)
+            broadband_signal_big = simulate_from_psd(P_bb, fs, n_fft, n_fft, random_seed=seed_bb, lambda_0=0.0)
+            P_rh_lin = P_bb * (np.power(10.0, G) - 1.0)  # linear “excess” over baseline
+            rhythmic_signal_big  = simulate_from_psd(P_rh_lin, fs, n_fft, n_fft, random_seed=seed_rh, lambda_0=0.0)
+
+        # Slice to requested duration and add any DC offset in time
+        combined_signal  = combined_signal_big[:n_time] + self.average_firing_rate
         broadband_signal = broadband_signal_big[:n_time]
-        rhythmic_signal = rhythmic_signal_big[:n_time]
-        combined_signal = combined_signal_big[:n_time]
+        rhythmic_signal  = rhythmic_signal_big[:n_time]
 
         time = np.arange(n_time) / fs
         from spectral_decomposition.time_domain import TimeDomainData
@@ -276,5 +275,75 @@ class CombinedSimulator(BaseSimulator):
             time=time,
             combined_signal=combined_signal,
             broadband_signal=broadband_signal,
-            rhythmic_signal=rhythmic_signal
+            rhythmic_signal=rhythmic_signal,
+        )
+
+
+    def simulate_legacy(self):
+        fs = self.sampling_rate
+        n_time = self.n_samples
+        n_fft = self.n_fft
+        freqs = self._build_two_sided_freqs()
+
+        # Broadband in *linear* power: 10^offset / (k + |f|^chi)
+        denom = (self.knee + np.abs(freqs) ** self.aperiodic_exponent)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            P_bb = (10.0 ** self.aperiodic_offset) / denom
+        # zero DC
+        P_bb[0] = 0.0
+
+        # Rhythmic field
+        if self.mode == "additive":
+            # linear-amplitude Gaussians added to linear PSD
+            P_rh = np.zeros_like(freqs)
+            for peak in self.peaks:
+                f0 = float(peak["freq"])
+                amp = float(peak["amplitude"])
+                sigma = float(peak["sigma"])
+                P_rh += amp * np.exp(-((freqs - f0) ** 2) / (2 * sigma ** 2))
+                P_rh += amp * np.exp(-((freqs + f0) ** 2) / (2 * sigma ** 2))
+            P_rh[0] = 0.0
+            P_comb = P_bb + P_rh
+
+        else:  # multiplicative
+            # Peaks are *log10-power* bumps: P = P_bb * 10**G
+            G = np.zeros_like(freqs)
+            for peak in self.peaks:
+                f0 = float(peak["freq"])
+                a_log = float(peak["amplitude"])  # interpret as log10 height
+                sigma = float(peak["sigma"])
+                G += a_log * np.exp(-((freqs - f0) ** 2) / (2 * sigma ** 2))
+                G += a_log * np.exp(-((freqs + f0) ** 2) / (2 * sigma ** 2))
+            P_comb = P_bb * np.power(10.0, G)
+            P_comb[0] = 0.0
+
+        # Simulate from *unshifted* PSD
+        combined_signal_big = simulate_from_psd(
+            P_comb, fs, n_fft, n_fft, random_seed=self.random_state, lambda_0=0.0
+        )
+
+        # (optional) separate draws for components if you want to expose them
+        # For now, keep backwards-compatible outputs by splitting via the same RNG seed
+        broadband_signal_big = simulate_from_psd(
+            P_bb, fs, n_fft, n_fft, random_seed=self.random_state, lambda_0=0.0
+        )
+        if self.mode == "additive":
+            P_rh_lin = P_comb - P_bb
+        else:
+            P_rh_lin = P_bb * (np.power(10.0, G) - 1.0)
+        rhythmic_signal_big = simulate_from_psd(
+            P_rh_lin, fs, n_fft, n_fft, random_seed=self.random_state, lambda_0=0.0
+        )
+
+        combined_signal = combined_signal_big[:n_time] + self.average_firing_rate
+        broadband_signal = broadband_signal_big[:n_time]
+        rhythmic_signal = rhythmic_signal_big[:n_time]
+
+        time = np.arange(n_time) / fs
+        from spectral_decomposition.time_domain import TimeDomainData
+        return TimeDomainData(
+            time=time,
+            combined_signal=combined_signal,
+            broadband_signal=broadband_signal,
+            rhythmic_signal=rhythmic_signal,
         )
